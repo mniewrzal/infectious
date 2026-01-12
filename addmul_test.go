@@ -45,11 +45,23 @@ func TestAddmul(t *testing.T) {
 		z := RandomBytes(size)
 		z1 := append([]byte(nil), z...)
 		z2 := append([]byte(nil), z...)
+		z3 := append([]byte(nil), z...)
 
 		addmulSlow(z1[align:], x[align:], y)
 		addmul(z2[align:], x[align:], y)
+		addmulSIMD(z3[align:], x[align:], y)
 
 		if !bytes.Equal(z1, z2) {
+			t.Logf("align: %d", align)
+			t.Logf("size: %d", size)
+			t.Logf("x: %x", x)
+			t.Logf("z: %x", z)
+			t.Logf("z1: %x", z1)
+			t.Logf("z2: %x", z2)
+			t.Fatal("mismatch")
+		}
+
+		if !bytes.Equal(z1, z3) {
 			t.Logf("align: %d", align)
 			t.Logf("size: %d", size)
 			t.Logf("x: %x", x)
@@ -70,6 +82,34 @@ func BenchmarkAddmul(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				y := byte(i * 29)
 				addmul(z, x, y)
+			}
+		})
+	}
+}
+
+func BenchmarkAddmulSIMD(b *testing.B) {
+	x, z := RandomBytes(1024), RandomBytes(1024)
+	for _, size := range []int{64, 128, 256, 1024} {
+		x, z := x[:size], z[:size]
+		b.Run(strconv.Itoa(size)+"B", func(b *testing.B) {
+			b.SetBytes(int64(size))
+			for i := 0; i < b.N; i++ {
+				y := byte(i * 29)
+				addmulSIMD(z, x, y)
+			}
+		})
+	}
+}
+
+func BenchmarkAddmulPlain(b *testing.B) {
+	x, z := RandomBytes(1024), RandomBytes(1024)
+	for _, size := range []int{64, 128, 256, 1024} {
+		x, z := x[:size], z[:size]
+		b.Run(strconv.Itoa(size)+"B", func(b *testing.B) {
+			b.SetBytes(int64(size))
+			for i := 0; i < b.N; i++ {
+				y := byte(i * 29)
+				addmulSlow(z, x, y)
 			}
 		})
 	}
