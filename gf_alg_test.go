@@ -24,6 +24,51 @@ package infectious
 
 import "testing"
 
+func TestGFValPow(t *testing.T) {
+	for b := 0; b < 256; b++ {
+		naive := gfVal(1)
+		for val := 0; val < 600; val++ {
+			if got := gfVal(b).pow(val); got != naive {
+				t.Fatalf("%d.pow(%d) = %02x, want %02x", b, val, got, naive)
+			}
+			naive = naive.mul(gfVal(b))
+		}
+	}
+
+	// negative exponents are taken in the multiplicative group, so
+	// b.pow(-val) is inv(b).pow(val).
+	for b := 1; b < 256; b++ {
+		inv, err := gfVal(b).inv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		naive := gfVal(1)
+		for val := 0; val < 600; val++ {
+			if got := gfVal(b).pow(-val); got != naive {
+				t.Fatalf("%d.pow(%d) = %02x, want %02x", b, -val, got, naive)
+			}
+			naive = naive.mul(inv)
+		}
+	}
+	if got := gfVal(0).pow(-1); got != 0 {
+		t.Fatalf("0.pow(-1) = %02x, want 0", got)
+	}
+}
+
+func TestGFPolyEval(t *testing.T) {
+	for _, p := range []gfPoly{nil, {0x35}, {0x01, 0x00, 0xac, 0x5e}, {0xfe, 0x35, 0x02, 0x01, 0x00}} {
+		for x := 0; x < 256; x++ {
+			naive := gfConst(0)
+			for i := 0; i <= p.deg(); i++ {
+				naive = naive.add(p.index(i).mul(gfVal(x).pow(i)))
+			}
+			if got := p.eval(gfVal(x)); got != naive {
+				t.Fatalf("%02x.eval(%02x) = %02x, want %02x", p, x, got, naive)
+			}
+		}
+	}
+}
+
 func TestGFPolyDiv(t *testing.T) {
 	q := gfPoly{
 		0x5e, 0x60, 0x8c, 0x3d, 0xc6, 0x8e, 0x7e, 0xa5, 0x2c, 0xa4, 0x04, 0x8a,

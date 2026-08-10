@@ -39,13 +39,17 @@ func gfConst(val byte) gfVal {
 	return gfVal(val)
 }
 
+// pow returns b to the power of val. Negative exponents are taken in the
+// multiplicative group, so b.pow(-v) is the inverse of b.pow(v) for nonzero
+// b, and 0.pow(val) is 0 for any nonzero val.
 func (b gfVal) pow(val int) gfVal {
-	out := gfVal(1)
-	mul_base := gf_mul_table[b][:]
-	for range val {
-		out = gfVal(mul_base[out])
+	if val == 0 {
+		return 1
 	}
-	return out
+	if b == 0 {
+		return 0
+	}
+	return gfVal(gf_exp[((int(gf_log[b])*val)%255+255)%255])
 }
 
 func (a gfVal) mul(b gfVal) gfVal {
@@ -234,12 +238,11 @@ func (p gfPoly) div(b gfPoly) (q, r gfPoly, err error) {
 	return q, p, nil
 }
 
+// eval uses Horner's method; p is stored highest-degree coefficient first.
 func (p gfPoly) eval(x gfVal) gfVal {
 	out := gfConst(0)
-	for i := 0; i <= p.deg(); i++ {
-		x_i := x.pow(i)
-		p_i := p.index(i)
-		out = out.add(p_i.mul(x_i))
+	for _, coef := range p {
+		out = out.mul(x).add(coef)
 	}
 	return out
 }
