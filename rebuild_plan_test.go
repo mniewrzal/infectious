@@ -25,10 +25,28 @@ package infectious
 import (
 	"bytes"
 	"fmt"
+	"math/bits"
 	"math/rand"
+	"slices"
 	"sort"
 	"testing"
 )
+
+// encodeShares returns all n shares of data, each owning its bytes. Encode
+// hands the data shares out as windows into its input, so they have to be
+// copied before the caller reuses the input buffer.
+func encodeShares(t testing.TB, code *FEC, data []byte) []Share {
+	t.Helper()
+
+	shares := make([]Share, code.Total())
+	err := code.Encode(data, func(s Share) {
+		shares[s.Number] = s.DeepCopy()
+	})
+	if err != nil {
+		t.Fatalf("failed to encode: %s", err)
+	}
+	return shares
+}
 
 // encodeForTest returns all n shares of some deterministic data, plus the
 // original data.
@@ -36,20 +54,18 @@ func encodeForTest(t testing.TB, code *FEC, block int) (data []byte, shares []Sh
 	t.Helper()
 
 	data = make([]byte, code.Required()*block)
-	rng := rand.New(rand.NewSource(42))
-	rng.Read(data)
+	rand.New(rand.NewSource(42)).Read(data)
 
-	shares = make([]Share, code.Total())
-	err := code.Encode(data, func(s Share) {
-		shares[s.Number] = Share{
-			Number: s.Number,
-			Data:   append([]byte(nil), s.Data...),
-		}
-	})
-	if err != nil {
-		t.Fatalf("failed to encode: %s", err)
+	return data, encodeShares(t, code, data)
+}
+
+// pickShares returns the named shares, in the order they were named.
+func pickShares(shares []Share, nums []int) []Share {
+	out := make([]Share, len(nums))
+	for i, num := range nums {
+		out[i] = shares[num]
 	}
-	return data, shares
+	return out
 }
 
 // collect runs a rebuild callback and returns the reassembled data, copying
@@ -61,10 +77,71 @@ func collect(k, block int) (out []byte, store func(Share)) {
 	}
 }
 
+// subsetsOfAtLeast returns every subset of 0..total-1 with at least k members,
+// each in ascending order.
+func subsetsOfAtLeast(total, k int) [][]int {
+	var subsets [][]int
+	for mask := 0; mask < 1<<total; mask++ {
+		if bits.OnesCount(uint(mask)) < k {
+			continue
+		}
+		nums := make([]int, 0, total)
+		for num := 0; num < total; num++ {
+			if mask&(1<<num) != 0 {
+				nums = append(nums, num)
+			}
+		}
+		subsets = append(subsets, nums)
+	}
+	return subsets
+}
+
+// checkRebuild runs both (*FEC).Rebuild and the planned rebuild over the same
+// shares, requires that the two agree with each other and with want, and
+// returns the planned output. label prefixes the failure messages, which name
+// the shares and the data themselves, so callers do not have to build a
+// description on the happy path -- this runs millions of times.
+func checkRebuild(t testing.TB, label string, nums []int, code *FEC, r *Rebuilder, subset []Share, block int, want []byte) []byte {
+	k := code.Required()
+
+	wantOut, wantStore := collect(k, block)
+	// Rebuild sorts in place, so hand it its own copy.
+	if err := code.Rebuild(slices.Clone(subset), wantStore); err != nil {
+		t.Fatalf("%sRebuild(%v): %s", label, nums, err)
+	}
+
+	gotOut, gotStore := collect(k, block)
+	if err := r.Rebuild(subset, gotStore); err != nil {
+		t.Fatalf("%splanned Rebuild(%v): %s", label, nums, err)
+	}
+
+	if !bytes.Equal(gotOut, wantOut) {
+		t.Fatalf("%sshares %v: planned rebuild gave %s, Rebuild gave %s",
+			label, nums, brief(gotOut), brief(wantOut))
+	}
+	if !bytes.Equal(gotOut, want) {
+		t.Fatalf("%sshares %v: planned rebuild gave %s, want %s",
+			label, nums, brief(gotOut), brief(want))
+	}
+	return gotOut
+}
+
+// brief renders b for a failure message. The large configs carry kilobytes of
+// random data, and dumping all of it helps nobody.
+func brief(b []byte) string {
+	const max = 32
+	if len(b) <= max {
+		return fmt.Sprintf("%x", b)
+	}
+	return fmt.Sprintf("%x...(%d bytes)", b[:max], len(b))
+}
+
 // TestRebuildPlanMatchesRebuild checks that a planned rebuild reconstructs
-// exactly what (*FEC).Rebuild does, over every share subset shape that the
-// slot selection can produce: leading data shares, trailing parity shares,
-// and random mixtures.
+// exactly what (*FEC).Rebuild does at production scale, over every share
+// subset shape the slot selection can produce: leading data shares, trailing
+// parity shares, and random mixtures. TestRebuildPlanExhaustiveSmall covers
+// small codes exhaustively; this one covers large ones and the share sizes
+// where the vectorized addmul kernel actually runs.
 func TestRebuildPlanMatchesRebuild(t *testing.T) {
 	const block = 512
 
@@ -119,35 +196,59 @@ func TestRebuildPlanMatchesRebuild(t *testing.T) {
 			}
 
 			for _, nums := range subsets {
-				subset := make([]Share, len(nums))
-				for i, num := range nums {
-					subset[i] = Share{
-						Number: num,
-						Data:   append([]byte(nil), shares[num].Data...),
-					}
-				}
-
-				wantOut, wantStore := collect(k, block)
-				// Rebuild sorts in place, so hand it its own copy.
-				legacy := append([]Share(nil), subset...)
-				if err := code.Rebuild(legacy, wantStore); err != nil {
-					t.Fatalf("Rebuild(%v): %s", nums, err)
-				}
-
 				plan, err := code.PlanRebuild(nums)
 				if err != nil {
 					t.Fatalf("PlanRebuild(%v): %s", nums, err)
 				}
-				gotOut, gotStore := collect(k, block)
-				if err := plan.NewRebuilder().Rebuild(subset, gotStore); err != nil {
-					t.Fatalf("planned Rebuild(%v): %s", nums, err)
-				}
 
-				if !bytes.Equal(gotOut, wantOut) {
-					t.Fatalf("planned rebuild differs from Rebuild for %v", nums)
+				checkRebuild(t, "", nums, code, plan.NewRebuilder(), pickShares(shares, nums), block, data)
+			}
+		})
+	}
+}
+
+// TestRebuildPlanExhaustiveSmall pushes every possible two byte input through
+// every share subset a small code can produce, checking the planned rebuild
+// against (*FEC).Rebuild and against the original data. Two bytes is small
+// enough to enumerate outright, so this covers the whole input space rather
+// than sampling it. Every conf must divide two bytes evenly; widening the
+// input costs a factor of 256 per byte, so this stays at two.
+func TestRebuildPlanExhaustiveSmall(t *testing.T) {
+	confs := []struct{ required, total int }{
+		{1, 3},
+		{2, 4},
+		{2, 5},
+	}
+
+	for _, conf := range confs {
+		conf := conf
+		t.Run(fmt.Sprintf("r%dt%d", conf.required, conf.total), func(t *testing.T) {
+			code, err := NewFEC(conf.required, conf.total)
+			if err != nil {
+				t.Fatalf("failed to create new fec code: %s", err)
+			}
+			k, block := conf.required, 2/conf.required
+
+			subsets := subsetsOfAtLeast(conf.total, k)
+
+			// One rebuilder per subset, built up front and reused across every
+			// input, so the reuse path runs on every iteration.
+			rebuilders := make([]*Rebuilder, len(subsets))
+			for i, nums := range subsets {
+				plan, err := code.PlanRebuild(nums)
+				if err != nil {
+					t.Fatalf("PlanRebuild(%v): %s", nums, err)
 				}
-				if !bytes.Equal(gotOut, data) {
-					t.Fatalf("planned rebuild does not recover the input for %v", nums)
+				rebuilders[i] = plan.NewRebuilder()
+			}
+
+			data := make([]byte, 2)
+			for v := 0; v < 1<<16; v++ {
+				data[0], data[1] = byte(v), byte(v>>8)
+				shares := encodeShares(t, code, data)
+
+				for i, nums := range subsets {
+					checkRebuild(t, "", nums, code, rebuilders[i], pickShares(shares, nums), block, data)
 				}
 			}
 		})
@@ -181,23 +282,10 @@ func TestRebuildPlanReuse(t *testing.T) {
 		data := make([]byte, required*block)
 		rng.Read(data)
 
-		shares := make([]Share, total)
-		if err := code.Encode(data, func(s Share) {
-			shares[s.Number] = Share{
-				Number: s.Number,
-				Data:   append([]byte(nil), s.Data...),
-			}
-		}); err != nil {
-			t.Fatalf("failed to encode: %s", err)
-		}
-
-		subset := make([]Share, 0, required)
-		for _, num := range nums {
-			subset = append(subset, shares[num])
-		}
+		shares := encodeShares(t, code, data)
 
 		out, store := collect(required, block)
-		if err := rebuilder.Rebuild(subset, store); err != nil {
+		if err := rebuilder.Rebuild(pickShares(shares, nums), store); err != nil {
 			t.Fatalf("round %d: %s", round, err)
 		}
 		if !bytes.Equal(out, data) {
@@ -250,6 +338,100 @@ func TestRebuildPlanErrors(t *testing.T) {
 	if err := rebuilder.Rebuild(ragged, func(Share) {}); err == nil {
 		t.Fatal("ragged shares: expected an error")
 	}
+}
+
+const (
+	// fuzzMaxTotal bounds n so every share number is selectable through the
+	// uint32 mask the fuzzer supplies.
+	fuzzMaxTotal = 32
+	// fuzzMaxBlock caps the share size so executions stay fast.
+	fuzzMaxBlock = 64
+)
+
+// fuzzCode maps two fuzzer bytes onto a code size below fuzzMaxTotal. The seed
+// corpus is written against it, so it stays a named function: f.Add takes the
+// raw bytes, and this is the only place that says what code they build.
+func fuzzCode(kRaw, extraRaw byte) (k, n int) {
+	k = 1 + int(kRaw)%(fuzzMaxTotal/2)
+	n = k + int(extraRaw)%(fuzzMaxTotal/2)
+	return k, n
+}
+
+// FuzzRebuildPlan cross-checks the planned rebuild against (*FEC).Rebuild on
+// fuzzer chosen codes, share subsets and data, and asserts the properties the
+// planned API adds on top: it leaves its inputs alone, and a Rebuilder carries
+// no state between calls.
+func FuzzRebuildPlan(f *testing.F) {
+	f.Add(byte(1), byte(2), uint32(0b0011), []byte("hi"))                          // r2t4, data shares only
+	f.Add(byte(1), byte(2), uint32(0b1100), []byte("hi"))                          // r2t4, parity only
+	f.Add(byte(0), byte(1), uint32(0b10), []byte("abcd"))                          // r1t2, the parity share
+	f.Add(byte(3), byte(4), uint32(0b11110000), []byte("some data to encode!"))    // r4t8, parity only
+	f.Add(byte(3), byte(2), ^uint32(0), []byte("0123456789abcdef"))                // r4t6, every share
+	f.Add(byte(7), byte(8), uint32(0b1010101010101010), []byte("...............")) // r8t16, alternating
+	f.Add(byte(0), byte(15), uint32(1<<15), []byte("x"))                           // r1t16, the highest share
+
+	f.Fuzz(func(t *testing.T, kRaw, extraRaw byte, mask uint32, data []byte) {
+		k, n := fuzzCode(kRaw, extraRaw)
+		if len(data) < k {
+			t.Skip()
+		}
+		block := min(len(data)/k, fuzzMaxBlock)
+		data = data[:k*block]
+
+		// The subset is exactly what the mask selects, so the shares a failing
+		// corpus entry used can be read straight off the mask.
+		nums := make([]int, 0, n)
+		for num := 0; num < n; num++ {
+			if mask&(1<<num) != 0 {
+				nums = append(nums, num)
+			}
+		}
+		if len(nums) < k {
+			t.Skip()
+		}
+		// PlanRebuild is documented to accept any order, and descending is the
+		// furthest from the ascending order it sorts into.
+		slices.Reverse(nums)
+
+		code, err := NewFEC(k, n)
+		if err != nil {
+			t.Fatalf("NewFEC(%d, %d): %s", k, n, err)
+		}
+		shares := encodeShares(t, code, data)
+		subset := pickShares(shares, nums)
+
+		numsBefore := slices.Clone(nums)
+		subsetBefore := make([]Share, len(subset))
+		for i := range subset {
+			subsetBefore[i] = subset[i].DeepCopy()
+		}
+
+		plan, err := code.PlanRebuild(nums)
+		if err != nil {
+			t.Fatalf("r%dt%d, PlanRebuild(%v): %s", k, n, nums, err)
+		}
+		rebuilder := plan.NewRebuilder()
+
+		label := fmt.Sprintf("r%dt%d: ", k, n)
+		got := checkRebuild(t, label, nums, code, rebuilder, subset, block, data)
+
+		// Neither the share numbers nor the shares themselves may be touched.
+		if !slices.Equal(nums, numsBefore) {
+			t.Fatalf("%sPlanRebuild modified shareNumbers %v, now %v", label, numsBefore, nums)
+		}
+		for i := range subsetBefore {
+			if subset[i].Number != subsetBefore[i].Number {
+				t.Fatalf("%sRebuild reordered shares %v, share %d now at %d",
+					label, numsBefore, subset[i].Number, i)
+			}
+			if !bytes.Equal(subset[i].Data, subsetBefore[i].Data) {
+				t.Fatalf("%sRebuild modified the data of share %d", label, subset[i].Number)
+			}
+		}
+
+		// A second pass through the same Rebuilder must land in the same place.
+		checkRebuild(t, label+"reused: ", nums, code, rebuilder, subset, block, got)
+	})
 }
 
 // BenchmarkRebuildStripes models the access pattern in uplink's stripe
