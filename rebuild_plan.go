@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 //
-// Copyright (C) 2016-2017 Vivint, Inc.
+// Copyright (C) 2026 Storj Labs, Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -79,30 +79,25 @@ func (f *FEC) PlanRebuild(shareNumbers []int) (*RebuildPlan, error) {
 		return nil, NotEnoughShares
 	}
 
+	sorted := append([]int(nil), shareNumbers...)
+	sort.Ints(sorted)
+
+	if sorted[0] < 0 {
+		return nil, fmt.Errorf("invalid share id: %d", sorted[0])
+	}
+	if last := sorted[len(sorted)-1]; last >= n {
+		return nil, fmt.Errorf("invalid share id: %d", last)
+	}
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i] == sorted[i-1] {
+			return nil, fmt.Errorf("duplicate share id: %d", sorted[i])
+		}
+	}
+
 	slotOf := make([]int, n)
 	for i := range slotOf {
 		slotOf[i] = -1
 	}
-
-	// slotOf doubles as the duplicate check while we validate: -2 marks
-	// "supplied", and the real slot indexes overwrite it below.
-	for _, num := range shareNumbers {
-		if num < 0 || num >= n {
-			return nil, fmt.Errorf("invalid share id: %d", num)
-		}
-		if slotOf[num] == -2 {
-			return nil, fmt.Errorf("duplicate share id: %d", num)
-		}
-		slotOf[num] = -2
-	}
-	for i := range slotOf {
-		if slotOf[i] == -2 {
-			slotOf[i] = -1
-		}
-	}
-
-	sorted := append([]int(nil), shareNumbers...)
-	sort.Ints(sorted)
 
 	m_dec := make([]byte, k*k)
 	slotShare := make([]int, k)
@@ -194,9 +189,7 @@ func (r *Rebuilder) Rebuild(shares []Share, output func(Share)) error {
 	p := r.plan
 
 	sharesv := r.sharesv
-	for i := range sharesv {
-		sharesv[i] = nil
-	}
+	clear(sharesv)
 
 	shareSize := -1
 	for _, share := range shares {
@@ -235,9 +228,7 @@ func (r *Rebuilder) Rebuild(shares []Share, output func(Share)) error {
 	buf := r.buf[:shareSize]
 
 	for _, i := range p.missing {
-		for j := range buf {
-			buf[j] = 0
-		}
+		clear(buf)
 
 		row := p.m_dec[i*p.k : i*p.k+p.k]
 		for col := 0; col < p.k; col++ {
